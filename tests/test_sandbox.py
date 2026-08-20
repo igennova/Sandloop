@@ -13,6 +13,7 @@ import pytest
 from sandbox import (
     MAX_OUTPUT_BYTES,
     SUPPORTED_LANGUAGES,
+    SandboxLimits,
     TRUNCATION_NOTICE,
     ExecutionResult,
     _resolve_language,
@@ -165,3 +166,42 @@ def test_code_cannot_write_to_its_own_mount():
     )
     assert "BLOCKED" in result.stdout
     assert "WROTE" not in result.stdout
+
+
+# --- Phase 2: network isolation ---------------------------------------------
+
+NET_PROBE = """
+import socket
+try:
+    socket.create_connection(("1.1.1.1", 53), timeout=4)
+    print("REACHABLE")
+except OSError as exc:
+    print("BLOCKED", type(exc).__name__)
+"""
+
+DNS_PROBE = """
+import socket
+try:
+    print("RESOLVED", socket.gethostbyname("example.com"))
+except OSError as exc:
+    print("BLOCKED", type(exc).__name__)
+"""
+
+
+@needs_docker
+def test_network_is_disabled_by_default():
+    result = run_code(NET_PROBE, timeout_seconds=20)
+    assert "BLOCKED" in result.stdout
+    assert "REACHABLE" not in result.stdout
+
+
+@needs_docker
+def test_dns_resolution_is_disabled_by_default():
+    result = run_code(DNS_PROBE, timeout_seconds=20)
+    assert "BLOCKED" in result.stdout
+
+
+@needs_docker
+def test_network_can_be_opted_into_explicitly():
+    result = run_code(NET_PROBE, timeout_seconds=20, limits=SandboxLimits(network=True))
+    assert "REACHABLE" in result.stdout

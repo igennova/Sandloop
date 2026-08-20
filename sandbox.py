@@ -55,6 +55,25 @@ SUPPORTED_LANGUAGES: dict[str, LanguageSpec] = {
 }
 
 
+@dataclass(frozen=True)
+class SandboxLimits:
+    """
+    Container-level isolation applied to every execution.
+
+    These are enforced by the kernel through Docker. The wall-clock timeout is
+    deliberately not here: it is enforced by this process rather than by the
+    container, so it stays a `run_code()` argument.
+    """
+
+    network: bool = False
+
+    def to_run_kwargs(self) -> dict[str, object]:
+        return {"network_mode": "bridge" if self.network else "none"}
+
+
+DEFAULT_LIMITS = SandboxLimits()
+
+
 class SandboxError(RuntimeError):
     """The sandbox itself failed. Code that merely exits non-zero is not an error."""
 
@@ -134,6 +153,7 @@ def run_code(
     code: str,
     language: str = "python",
     timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
+    limits: SandboxLimits = DEFAULT_LIMITS,
 ) -> ExecutionResult:
     """
     Run `code` in a fresh container and return what it printed.
@@ -161,6 +181,7 @@ def run_code(
             volumes={str(workdir): {"bind": "/code", "mode": "ro"}},
             working_dir="/code",
             detach=True,
+            **limits.to_run_kwargs(),
         )
 
         try:
@@ -198,12 +219,21 @@ def main(argv: list[str] | None = None) -> int:
         "-t", "--timeout", type=float, default=DEFAULT_TIMEOUT_SECONDS,
         help=f"wall-clock seconds before the container is killed (default {DEFAULT_TIMEOUT_SECONDS:g})",
     )
+    parser.add_argument(
+        "--allow-network", action="store_true",
+        help="give the container egress (off by default)",
+    )
     args = parser.parse_args(argv)
 
     code = Path(args.file).read_text(encoding="utf-8") if args.file else sys.stdin.read()
 
     try:
-        result = run_code(code, language=args.language, timeout_seconds=args.timeout)
+        result = run_code(
+            code,
+            language=args.language,
+            timeout_seconds=args.timeout,
+            limits=SandboxLimits(network=args.allow_network),
+        )
     except (SandboxError, ValueError) as exc:
         print(f"sandbox error: {exc}", file=sys.stderr)
         return 2
