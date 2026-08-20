@@ -16,8 +16,8 @@ run in production.
 | Phase | Scope | State |
 |-------|-------|-------|
 | 1 | Docker runner — execute code, capture output, guarantee teardown | **done** |
-| 2 | Isolation hardening — no network, cgroup limits, read-only rootfs, non-root | next |
-| 3 | Agent loop — LLM calls the sandbox as a tool | |
+| 2 | Isolation hardening — no network, cgroup limits, read-only rootfs, non-root | **done** |
+| 3 | Agent loop — LLM calls the sandbox as a tool | next |
 | 4 | File I/O — a persistent per-session workspace | |
 | 5 | Concurrency and a reaper for stale containers | |
 | 6 | Adversarial testing — fork bombs, memory hogs, egress attempts | |
@@ -71,19 +71,43 @@ directory deleted in a `finally`, including on timeout and on Docker errors.
 Cleanup is best-effort and never raises, so it cannot mask the original failure.
 Two tests assert no container and no temp directory survives a run.
 
-## What Phase 1 does *not* do
+## Isolation
 
-The container is not hardened yet. Code running in it currently has network
-access, no memory or CPU ceiling, no PID limit, a writable root filesystem, and
-runs as root. The only things standing between a script and the host are
-Docker's default namespacing and the read-only `/code` mount.
+Every execution runs under `SandboxLimits`, verified from inside the container
+by reading its own cgroup files:
 
-Two bounds do exist, because without them the runner cannot be tested safely:
-a wall-clock timeout that kills the container, and a 64 KB cap on captured
-output so a runaway `print` loop cannot exhaust host memory.
+| Control | Setting | Effect |
+|---------|---------|--------|
+| `network_mode` | `none` | no sockets, no DNS |
+| `mem_limit` / `memswap_limit` | `256m` / `256m` | OOM-killed at the ceiling, no swap headroom |
+| `nano_cpus` | `0.5` CPU | `cpu.max` = `50000 100000` |
+| `pids_limit` | `64` | a fork bomb stops at 63 children |
+| `read_only` | `True` | the image cannot be modified |
+| `tmpfs` | `/tmp`, 64 MB, `mode=1777` | scratch space that cannot fill the host disk |
+| `user` | `65534:65534` | not root |
 
-Closing the rest is Phase 2: `--network none`, `--memory`, `--cpus`,
-`--pids-limit`, `--read-only` with a tmpfs `/tmp`, and a non-root user.
+Overriding them is explicit:
+
+```python
+run_code(code, limits=SandboxLimits(network=True, memory="1g"))
+```
+
+Two bounds live outside the container because the kernel cannot enforce them
+for us: the wall-clock timeout, which kills a container that never exits, and
+the 64 KB cap on captured output, which stops a runaway `print` from
+exhausting *this* process's memory while decoding logs.
+
+One detail worth knowing if you port this to Linux: `mkdtemp` creates the
+staging directory `0700` owned by the host user, which a non-root container
+user cannot traverse. The runner widens it to `0755`/`0644` before mounting.
+The mount is read-only, so the extra read bit grants nothing else.
+
+### Still open
+
+An escape through the shared kernel. Docker containers are namespaces and
+cgroups, not a security boundary against a determined attacker with a kernel
+exploit. Closing that means gVisor or Firecracker, which is a runtime swap
+rather than a code change — the scaling step, not a Phase 2 gap.
 
 ## Tests
 
@@ -91,6 +115,8 @@ Closing the rest is Phase 2: `--network none`, `--memory`, `--cpus`,
 pytest tests/ -v
 ```
 
-14 integration tests covering output capture, stream separation, exit codes,
-truncation, timeout kill, and teardown guarantees. They need a running Docker
-daemon and skip cleanly without one.
+31 tests covering output capture, stream separation, exit codes, truncation,
+timeout kill, teardown guarantees, and each isolation control above — network
+and DNS blocked, OOM kill at the memory ceiling, the fork ceiling, read-only
+rootfs, tmpfs size cap and non-persistence, and non-root execution. The
+integration tests need a running Docker daemon and skip cleanly without one.

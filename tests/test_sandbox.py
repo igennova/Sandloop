@@ -328,3 +328,31 @@ def test_scratch_does_not_survive_between_runs():
         'print("EXISTS" if os.path.exists("/tmp/leak.txt") else "CLEAN")\n'
     )
     assert "CLEAN" in result.stdout
+
+
+# --- Phase 2: privileges ----------------------------------------------------
+
+
+def test_user_maps_to_docker_kwargs():
+    assert SandboxLimits().to_run_kwargs()["user"] == "65534:65534"
+
+
+@needs_docker
+def test_code_does_not_run_as_root():
+    result = run_code('import os; print("UID", os.getuid(), "GID", os.getgid())')
+    assert result.ok is True
+    assert "UID 0 " not in result.stdout
+    assert "UID 65534" in result.stdout
+
+
+@needs_docker
+def test_unprivileged_user_can_still_read_its_script():
+    # The bind mount is 0755/0644 precisely so this works.
+    result = run_code('print(open("/code/script.py").read().strip())')
+    assert 'print(open("/code/script.py").read().strip())' in result.stdout
+
+
+@needs_docker
+def test_unprivileged_user_still_gets_writable_scratch():
+    result = run_code('open("/tmp/x", "w").write("ok"); print("WROTE")')
+    assert "WROTE" in result.stdout

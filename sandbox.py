@@ -71,6 +71,9 @@ class SandboxLimits:
     pids: int = 64
     read_only_rootfs: bool = True
     tmpfs_size: str = "64m"
+    # Numeric rather than "nobody" so it does not depend on the image
+    # shipping that account. 65534 is the conventional nobody uid.
+    user: str = "65534:65534"
 
     def to_run_kwargs(self) -> dict[str, object]:
         return {
@@ -88,6 +91,7 @@ class SandboxLimits:
             # ordinary scripts. Give back one small scratch mount, in memory,
             # capped so filling it cannot fill the host disk.
             "tmpfs": {"/tmp": f"size={self.tmpfs_size},mode=1777"},
+            "user": self.user,
         }
 
 
@@ -193,7 +197,13 @@ def run_code(
 
     try:
         workdir = Path(tempfile.mkdtemp(prefix="sandloop-"))
-        (workdir / spec.filename).write_text(code, encoding="utf-8")
+        script = workdir / spec.filename
+        script.write_text(code, encoding="utf-8")
+        # mkdtemp is 0700 and the file 0600, both owned by the host user, so
+        # an unprivileged container user could not traverse or read them.
+        # The mount is read-only, so widening the read bit grants nothing else.
+        workdir.chmod(0o755)
+        script.chmod(0o644)
 
         container = client.containers.run(
             image=spec.image,
