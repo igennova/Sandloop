@@ -68,6 +68,7 @@ class SandboxLimits:
     network: bool = False
     memory: str = "256m"
     cpus: float = 0.5
+    pids: int = 64
 
     def to_run_kwargs(self) -> dict[str, object]:
         return {
@@ -77,6 +78,9 @@ class SandboxLimits:
             # buying itself extra room in swap once RAM is exhausted.
             "memswap_limit": self.memory,
             "nano_cpus": int(self.cpus * 1_000_000_000),
+            # Bounds process creation, so a fork bomb exhausts its own quota
+            # instead of the host's process table.
+            "pids_limit": self.pids,
         }
 
 

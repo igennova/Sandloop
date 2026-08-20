@@ -236,3 +236,37 @@ def test_memory_under_the_ceiling_still_runs():
     )
     assert "ALLOCATED" in result.stdout
     assert result.ok is True
+
+
+# --- Phase 2: process limit -------------------------------------------------
+
+# Deliberately bounded rather than a true `while True: fork()`. It proves the
+# same property — forking stops at the quota — without betting the host on the
+# flag having been applied correctly.
+FORK_PROBE = """
+import os, time
+forked = 0
+try:
+    while forked < 300:
+        if os.fork() == 0:
+            time.sleep(10)
+            os._exit(0)
+        forked += 1
+except OSError as exc:
+    print("BLOCKED", forked, type(exc).__name__)
+else:
+    print("FORKED", forked)
+"""
+
+
+def test_pids_limit_maps_to_docker_kwargs():
+    assert SandboxLimits(pids=32).to_run_kwargs()["pids_limit"] == 32
+
+
+@needs_docker
+def test_fork_bomb_hits_the_pid_ceiling():
+    result = run_code(FORK_PROBE, timeout_seconds=60)
+    assert "BLOCKED" in result.stdout
+    assert "FORKED 300" not in result.stdout
+    forked = int(result.stdout.split()[1])
+    assert forked < 64, f"forked {forked} processes, expected to stop under the 64 limit"
