@@ -69,6 +69,8 @@ class SandboxLimits:
     memory: str = "256m"
     cpus: float = 0.5
     pids: int = 64
+    read_only_rootfs: bool = True
+    tmpfs_size: str = "64m"
 
     def to_run_kwargs(self) -> dict[str, object]:
         return {
@@ -81,6 +83,11 @@ class SandboxLimits:
             # Bounds process creation, so a fork bomb exhausts its own quota
             # instead of the host's process table.
             "pids_limit": self.pids,
+            "read_only": self.read_only_rootfs,
+            # A read-only rootfs leaves nowhere to write at all, which breaks
+            # ordinary scripts. Give back one small scratch mount, in memory,
+            # capped so filling it cannot fill the host disk.
+            "tmpfs": {"/tmp": f"size={self.tmpfs_size},mode=1777"},
         }
 
 

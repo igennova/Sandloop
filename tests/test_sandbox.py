@@ -270,3 +270,61 @@ def test_fork_bomb_hits_the_pid_ceiling():
     assert "FORKED 300" not in result.stdout
     forked = int(result.stdout.split()[1])
     assert forked < 64, f"forked {forked} processes, expected to stop under the 64 limit"
+
+
+# --- Phase 2: filesystem ----------------------------------------------------
+
+
+def test_filesystem_limits_map_to_docker_kwargs():
+    kwargs = SandboxLimits(tmpfs_size="16m").to_run_kwargs()
+    assert kwargs["read_only"] is True
+    assert kwargs["tmpfs"] == {"/tmp": "size=16m,mode=1777"}
+
+
+@needs_docker
+def test_root_filesystem_is_read_only():
+    result = run_code(
+        'try:\n'
+        '    open("/etc/passwd", "a").write("x")\n'
+        '    print("WROTE")\n'
+        'except OSError as exc:\n'
+        '    print("BLOCKED", type(exc).__name__)\n'
+    )
+    assert "BLOCKED" in result.stdout
+    assert "WROTE" not in result.stdout
+
+
+@needs_docker
+def test_tmp_is_writable_scratch_space():
+    result = run_code(
+        'open("/tmp/scratch.txt", "w").write("hello")\n'
+        'print("READBACK", open("/tmp/scratch.txt").read())\n'
+    )
+    assert "READBACK hello" in result.stdout
+    assert result.ok is True
+
+
+@needs_docker
+def test_tmpfs_is_size_capped():
+    # 32 MB written into a 16 MB tmpfs must fail rather than grow.
+    result = run_code(
+        'try:\n'
+        '    with open("/tmp/big", "wb") as fh:\n'
+        '        fh.write(b"x" * (32 * 1024 * 1024))\n'
+        '    print("WROTE")\n'
+        'except OSError as exc:\n'
+        '    print("BLOCKED", type(exc).__name__)\n',
+        timeout_seconds=60,
+        limits=SandboxLimits(tmpfs_size="16m"),
+    )
+    assert "BLOCKED" in result.stdout
+
+
+@needs_docker
+def test_scratch_does_not_survive_between_runs():
+    run_code('open("/tmp/leak.txt", "w").write("first")')
+    result = run_code(
+        'import os\n'
+        'print("EXISTS" if os.path.exists("/tmp/leak.txt") else "CLEAN")\n'
+    )
+    assert "CLEAN" in result.stdout
