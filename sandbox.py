@@ -66,9 +66,18 @@ class SandboxLimits:
     """
 
     network: bool = False
+    memory: str = "256m"
+    cpus: float = 0.5
 
     def to_run_kwargs(self) -> dict[str, object]:
-        return {"network_mode": "bridge" if self.network else "none"}
+        return {
+            "network_mode": "bridge" if self.network else "none",
+            "mem_limit": self.memory,
+            # Matching swap to the memory ceiling stops the container from
+            # buying itself extra room in swap once RAM is exhausted.
+            "memswap_limit": self.memory,
+            "nano_cpus": int(self.cpus * 1_000_000_000),
+        }
 
 
 DEFAULT_LIMITS = SandboxLimits()

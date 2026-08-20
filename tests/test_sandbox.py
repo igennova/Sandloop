@@ -205,3 +205,34 @@ def test_dns_resolution_is_disabled_by_default():
 def test_network_can_be_opted_into_explicitly():
     result = run_code(NET_PROBE, timeout_seconds=20, limits=SandboxLimits(network=True))
     assert "REACHABLE" in result.stdout
+
+
+# --- Phase 2: memory and CPU ------------------------------------------------
+
+
+def test_limits_map_to_docker_kwargs():
+    kwargs = SandboxLimits(memory="128m", cpus=0.25).to_run_kwargs()
+    assert kwargs["mem_limit"] == "128m"
+    assert kwargs["memswap_limit"] == "128m"  # no swap headroom
+    assert kwargs["nano_cpus"] == 250_000_000
+
+
+@needs_docker
+def test_memory_hog_is_killed_not_served():
+    # 512 MB against a 256 MB ceiling: the kernel OOM killer should end it.
+    result = run_code(
+        'blob = bytearray(512 * 1024 * 1024)\nprint("ALLOCATED", len(blob))\n',
+        timeout_seconds=60,
+    )
+    assert "ALLOCATED" not in result.stdout
+    assert result.ok is False
+
+
+@needs_docker
+def test_memory_under_the_ceiling_still_runs():
+    result = run_code(
+        'blob = bytearray(32 * 1024 * 1024)\nprint("ALLOCATED", len(blob))\n',
+        timeout_seconds=60,
+    )
+    assert "ALLOCATED" in result.stdout
+    assert result.ok is True
