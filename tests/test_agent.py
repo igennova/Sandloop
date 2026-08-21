@@ -214,3 +214,103 @@ def test_failing_code_is_flagged_but_does_not_stop_the_loop():
     run = run_agent("x", client, executor=failing)
     assert run.transcript[2].results[0].is_error is True
     assert run.final_text == "I will fix it"
+
+
+# --- results the model can act on -------------------------------------------
+
+from agent import _format_result
+from sandbox import TRUNCATION_NOTICE
+
+
+def _result(**kwargs):
+    base = dict(stdout="", stderr="", exit_code=0, duration_seconds=0.1)
+    return ExecutionResult(**{**base, **kwargs})
+
+
+def test_oom_kill_explains_itself():
+    # exit 137 with empty stderr is the case the model cannot diagnose alone.
+    text = _format_result(_result(exit_code=137))
+    assert "137" in text
+    assert "memory" in text.lower()
+    assert "256m" in text.lower()
+
+
+def test_timeout_states_the_limit_it_hit():
+    text = _format_result(_result(timed_out=True, exit_code=-1), timeout_seconds=5)
+    assert "TIMED OUT" in text
+    assert "5s" in text
+
+
+def test_segfault_is_named():
+    assert "segmentation fault" in _format_result(_result(exit_code=139))
+
+
+def test_silent_success_tells_the_model_to_print():
+    text = _format_result(_result(exit_code=0))
+    assert "printed nothing" in text
+
+
+def test_a_killed_run_is_not_also_scolded_for_printing_nothing():
+    # The kill already explains the silence; both notes at once is noise.
+    assert "printed nothing" not in _format_result(_result(exit_code=137))
+    assert "printed nothing" not in _format_result(_result(timed_out=True, exit_code=-1))
+
+
+def test_truncated_output_is_flagged():
+    text = _format_result(_result(stdout="x" * 100 + TRUNCATION_NOTICE))
+    assert "truncated" in text
+
+
+def test_ordinary_output_is_not_editorialised():
+    text = _format_result(_result(stdout="42\n"))
+    assert "42" in text
+    assert "NOTE:" not in text
+
+
+def test_stderr_is_labelled_separately():
+    text = _format_result(_result(stdout="out", stderr="err", exit_code=1))
+    assert "stdout:\nout" in text
+    assert "stderr:\nerr" in text
+
+
+# --- end to end through the real sandbox ------------------------------------
+
+try:
+    import docker as _docker
+
+    _docker.from_env().ping()
+    _DOCKER_UP = True
+except Exception:  # noqa: BLE001
+    _DOCKER_UP = False
+
+real_docker = pytest.mark.skipif(not _DOCKER_UP, reason="Docker daemon not available")
+
+
+@real_docker
+def test_loop_runs_real_code_and_returns_real_output():
+    client = ScriptedClient(
+        AssistantTurn(tool_calls=(
+            ToolCall("t1", "execute_code", {"code": "print(6 * 7)", "language": "python"}),
+        )),
+        AssistantTurn(text="42"),
+    )
+    run = run_agent("what is 6*7", client)  # real run_code, no fake
+    assert "42" in run.transcript[2].results[0].content
+    assert run.final_text == "42"
+
+
+@real_docker
+def test_real_oom_reaches_the_model_with_an_explanation():
+    client = ScriptedClient(
+        AssistantTurn(tool_calls=(
+            ToolCall("t1", "execute_code", {
+                "code": 'b = bytearray(512 * 1024 * 1024)\nprint("done")',
+                "language": "python",
+            }),
+        )),
+        AssistantTurn(text="too big"),
+    )
+    run = run_agent("allocate a lot", client, timeout_seconds=60)
+    result = run.transcript[2].results[0]
+    assert result.is_error is True
+    assert "memory" in result.content.lower()

@@ -14,7 +14,10 @@ from dataclasses import dataclass
 from typing import Any, Callable, Protocol, Sequence
 
 from sandbox import (
+    DEFAULT_TIMEOUT_SECONDS,
     SUPPORTED_LANGUAGES,
+    TRUNCATION_NOTICE,
+    DEFAULT_LIMITS,
     ExecutionResult,
     SandboxError,
     run_code,
@@ -123,16 +126,67 @@ class AgentRun:
     hit_iteration_cap: bool
 
 
-def _format_result(result: ExecutionResult) -> str:
-    parts = [f"exit_code: {result.exit_code}"]
+# Deaths by signal arrive with an empty stderr — the kernel kills the process,
+# so there is no traceback to read. Without a note the model sees a bare exit
+# code and retries the identical snippet.
+SIGNAL_NOTES: dict[int, str] = {
+    137: (
+        f"killed by the sandbox (SIGKILL): it exceeded the "
+        f"{DEFAULT_LIMITS.memory} memory limit. Process less data at a time, or "
+        f"stream instead of building the whole result in memory."
+    ),
+    139: "crashed with a segmentation fault.",
+    143: "terminated by the sandbox (SIGTERM).",
+}
+
+
+def _format_result(
+    result: ExecutionResult, timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS
+) -> str:
+    """
+    Render an ExecutionResult as something the model can act on.
+
+    Anything the model could not infer from stdout alone is stated outright:
+    why it was killed, that output was cut, or that it printed nothing.
+    """
+    lines: list[str] = []
+
+    if result.timed_out:
+        lines.append(
+            f"TIMED OUT: still running after {timeout_seconds:g}s and killed. "
+            f"The work is too slow or the code does not terminate."
+        )
+    elif result.exit_code in SIGNAL_NOTES:
+        lines.append(f"exit_code: {result.exit_code} — {SIGNAL_NOTES[result.exit_code]}")
+    else:
+        lines.append(f"exit_code: {result.exit_code}")
+
     if result.stdout:
-        parts.append(f"stdout:\n{result.stdout}")
+        lines.append(f"stdout:\n{result.stdout.rstrip()}")
     if result.stderr:
-        parts.append(f"stderr:\n{result.stderr}")
-    return "\n".join(parts)
+        lines.append(f"stderr:\n{result.stderr.rstrip()}")
+
+    if TRUNCATION_NOTICE in result.stdout or TRUNCATION_NOTICE in result.stderr:
+        lines.append(
+            "NOTE: output was truncated. Print less, or summarise inside the snippet."
+        )
+
+    # Only on a clean run. After a kill the absence of output is explained by
+    # the kill, and saying "you printed nothing" would just be misleading.
+    if result.ok and not result.stdout and not result.stderr:
+        lines.append(
+            "NOTE: the snippet ran but printed nothing. Results are only visible "
+            "if the code prints them."
+        )
+
+    return "\n".join(lines)
 
 
-def _dispatch(call: ToolCall, executor: Executor) -> ToolResult:
+def _dispatch(
+    call: ToolCall,
+    executor: Executor,
+    timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
+) -> ToolResult:
     """
     Run one tool call. Never raises: a malformed call or a broken sandbox comes
     back as an error result so the model can read it and adjust, which is the
@@ -151,13 +205,15 @@ def _dispatch(call: ToolCall, executor: Executor) -> ToolResult:
         return ToolResult(call.id, "The 'code' argument is required.", is_error=True)
 
     try:
-        result = executor(code, language=language)
+        result = executor(code, language=language, timeout_seconds=timeout_seconds)
     except ValueError as exc:  # unsupported language
         return ToolResult(call.id, str(exc), is_error=True)
     except SandboxError as exc:  # the sandbox itself is broken
         return ToolResult(call.id, f"Sandbox unavailable: {exc}", is_error=True)
 
-    return ToolResult(call.id, _format_result(result), is_error=not result.ok)
+    return ToolResult(
+        call.id, _format_result(result, timeout_seconds), is_error=not result.ok
+    )
 
 
 def run_agent(
@@ -165,6 +221,7 @@ def run_agent(
     client: LLMClient,
     max_iterations: int = DEFAULT_MAX_ITERATIONS,
     executor: Executor = run_code,
+    timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
 ) -> AgentRun:
     """
     Drive the model until it answers without asking for a tool.
@@ -187,7 +244,9 @@ def run_agent(
             return AgentRun(tuple(transcript), turn.text, iteration, False)
 
         # Every call in the turn is answered, together, in one result turn.
-        results = tuple(_dispatch(call, executor) for call in turn.tool_calls)
+        results = tuple(
+            _dispatch(call, executor, timeout_seconds) for call in turn.tool_calls
+        )
         transcript.append(ToolResultTurn(results))
 
     return AgentRun(tuple(transcript), turn.text, max_iterations, True)
